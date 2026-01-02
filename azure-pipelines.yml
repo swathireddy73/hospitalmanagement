@@ -1,0 +1,198 @@
+trigger:
+- master
+
+variables:
+- group: HospitalManagement
+- name: IMAGE_TAG
+  value: $(Build.BuildId)
+
+pool:
+  name: MySelfHostedPool
+
+stages:
+
+# ===============================
+# Stage 1: Checkout
+# ===============================
+- stage: Checkout
+  displayName: Checkout Code
+  jobs:
+  - job: Checkout
+    steps:
+    - checkout: self
+      clean: true
+
+# ===============================
+# Stage 2: SonarQube Analysis
+# ===============================
+- stage: SonarQubeAnalysis
+  displayName: SonarQube Analysis
+  dependsOn: Checkout
+  jobs:
+  - job: SonarQube
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: Install Node.js
+
+    - task: CmdLine@2
+      displayName: Install Sonar Scanner
+      inputs:
+        script: npm install -g sonar-scanner
+
+    - task: CmdLine@2
+      displayName: Clear Sonar Cache
+      inputs:
+        script: |
+          IF EXIST "%USERPROFILE%\.sonar\cache" rmdir /s /q "%USERPROFILE%\.sonar\cache"
+
+    - task: CmdLine@2
+      displayName: Run SonarQube Scan
+      inputs:
+        script: |
+          sonar-scanner ^
+            -Dsonar.projectKey=HospitalManagement ^
+            -Dsonar.projectName=HospitalManagement ^
+            -Dsonar.sources=. ^
+            -Dsonar.host.url="$(SONAR_HOST_URL)" ^
+            -Dsonar.login="$(SONAR_TOKEN)"
+
+# ===============================
+# Stage 3: Build & Push Docker Image
+# ===============================
+- stage: BuildAndPush
+  displayName: Build & Push Docker Image
+  dependsOn: SonarQubeAnalysis
+  jobs:
+  - job: DockerBuild
+    steps:
+    - task: Docker@2
+      displayName: Build and Push Image
+      inputs:
+        containerRegistry: Docker
+        repository: swathireddy73/hospitalmanagement
+        command: buildAndPush
+        Dockerfile: '**/Dockerfile'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+# ===============================
+# Stage 4: Helm Deployment
+# ===============================
+- stage: HelmDeployment
+  displayName: Helm Deployment
+  dependsOn: BuildAndPush
+  jobs:
+  - job: HelmDeploy
+    displayName: Helm Deployment
+    steps:
+    - task: CmdLine@2
+      displayName: Verify Helm Version
+      inputs:
+        script: '"C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" version'
+
+    - task: CmdLine@2
+      displayName: Create Helm Chart
+      inputs:
+        script: |
+          if not exist "helm-chart\Chart.yaml" (
+            "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" create helm-chart
+          )
+
+    - task: CmdLine@2
+      displayName: Helm Template - Render All Services
+      inputs:
+        script: |
+          "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" template hospitalmanagement ./helm-chart ^
+            --set image.repository=swathireddy73/hospitalmanagement ^
+            --set image.tag=$(IMAGE_TAG) ^
+            --debug
+
+# ===============================
+# Stage 5: Deploy to AKS - Dev
+# ===============================
+- stage: DeployToDev
+  displayName: Deploy to AKS Dev
+  dependsOn: HelmDeployment
+  jobs:
+  - job: AKSDev
+    displayName: Deploy to Dev
+    steps:
+    - task: CmdLine@2
+      displayName: AKS Dev Deployment
+      inputs:
+        script: |
+          az login --service-principal ^
+            -u $(AZURE_CLIENT_ID) ^
+            -p $(AZURE_CLIENT_SECRET) ^
+            --tenant $(AZURE_TENANT_ID)
+
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+
+          az aks get-credentials ^
+            --resource-group $(AKS_RESOURCE_GROUP) ^
+            --name $(AKS_CLUSTER_NAME) ^
+            --overwrite-existing
+
+          "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" dependency update ./helm-chart
+
+          "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" upgrade --install hospitalmanagement ./helm-chart ^
+            --namespace $(NAMESPACE_DEV) ^
+            --create-namespace ^
+            --set image.repository=swathireddy73/hospitalmanagement ^
+            --set image.tag=$(IMAGE_TAG) ^
+            --atomic --wait
+
+          echo ===== Fetching Application URL =====
+          set SERVICE_IP=$(kubectl get svc hospital-frontend -n $(NAMESPACE_DEV) -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+          set SERVICE_PORT=$(kubectl get svc hospital-frontend -n $(NAMESPACE_DEV) -o jsonpath="{.spec.ports[0].port}")
+          echo Application URL: http://%SERVICE_IP%:%SERVICE_PORT%
+          echo ====================================
+
+          az logout
+
+# ===============================
+# Stage 6: Deploy to AKS - Prod
+# ===============================
+- stage: DeployToProd
+  displayName: Deploy to AKS Prod
+  dependsOn: DeployToDev
+  jobs:
+  - job: AKSProd
+    displayName: Deploy to Prod
+    steps:
+    - task: CmdLine@2
+      displayName: AKS Prod Deployment
+      inputs:
+        script: |
+          az login --service-principal ^
+            -u $(AZURE_CLIENT_ID) ^
+            -p $(AZURE_CLIENT_SECRET) ^
+            --tenant $(AZURE_TENANT_ID)
+
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+
+          az aks get-credentials ^
+            --resource-group $(AKS_RESOURCE_GROUP) ^
+            --name $(AKS_CLUSTER_NAME) ^
+            --overwrite-existing
+
+          "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" dependency update ./helm-chart
+
+          "C:\Users\swath\Downloads\helm-v3.17.1-windows-amd64\windows-amd64\helm.exe" upgrade --install hospitalmanagement ./helm-chart ^
+            --namespace $(NAMESPACE_PROD) ^
+            --create-namespace ^
+            --set image.repository=swathireddy73/hospitalmanagement ^
+            --set image.tag=$(IMAGE_TAG) ^
+            --atomic --wait
+
+          echo ===== Fetching Application URL =====
+          set SERVICE_IP=$(kubectl get svc hospital-frontend -n $(NAMESPACE_PROD) -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+          set SERVICE_PORT=$(kubectl get svc hospital-frontend -n $(NAMESPACE_PROD) -o jsonpath="{.spec.ports[0].port}")
+          echo Application URL: http://%SERVICE_IP%:%SERVICE_PORT%
+          echo ====================================
+
+          az logout
+
